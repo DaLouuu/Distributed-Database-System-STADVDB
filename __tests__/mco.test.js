@@ -1,309 +1,381 @@
-const mysql = require('mysql2/promise');
+// __tests__/mco.test.js
+// Unified Master Test Suite for GameVault Distributed Database System
+
 const request = require('supertest');
-const app = require('../backend/testApp'); // Use server3.js for Jest testing
-const shell = require('shelljs');
-const { expect } = require('@jest/globals');
+const app = require('../backend/server2');
+const {
+  queryNode,
+  withTransaction,
+  setSimulatedFailure,
+  resetMockDatabases,
+  setMockMode,
+  getActiveNodeKey,
+  setActiveNodeKey,
+  getMockDatabases
+} = require('../backend/db');
 
-// Define configurations for each test node
-const dbConfigs = {
-  master: {
-    host: '127.0.0.1',
-    port: 3300,
-    user: 'root',
-    password: '1234',
-    database: 'mco_db'
-  },
-  slave1: {
-    host: '127.0.0.1',
-    port: 3306,
-    user: 'root',
-    password: '1234',
-    database: 'mco_db'
-  },
-  slave2: {
-    host: '127.0.0.1',
-    port: 3307,
-    user: 'root',
-    password: '1234',
-    database: 'mco_db'
-  }
-};
+const {
+  clearAllLogs,
+  getAllPendingReplications,
+  getPendingReplicationsForNode,
+  loadQueueFromDisk,
+  claimReplicationEntry,
+  hasPendingReplications
+} = require('../backend/replicationLog');
 
-// Function to create a connection to the database
-async function createConnection(config) {
-  const connection = await mysql.createConnection(config);
-  await connection.query('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
-  return connection;
-}
+describe('GameVault Distributed Database System - Comprehensive Master Test Suite', () => {
 
-beforeAll(async () => {
-  // Create a connection to the master to clear existing data and insert new data
-  const masterConnection = await createConnection(dbConfigs.master);
+  beforeAll(async () => {
+    setMockMode(true);
+  });
 
-  // Disable safe updates for the current session to allow DELETE without conditions
-  await masterConnection.query('SET SQL_SAFE_UPDATES = 0');
+  beforeEach(async () => {
+    resetMockDatabases();
+    clearAllLogs();
+    setSimulatedFailure('node1', false);
+    setSimulatedFailure('node2', false);
+    setSimulatedFailure('node3', false);
+    setActiveNodeKey('node1');
+  });
 
-  // Delete all records from relevant tables to start with a clean slate
-  await masterConnection.query('DELETE FROM games');
-  await masterConnection.query('DELETE FROM games_before_2010');
-  await masterConnection.query('DELETE FROM games_2010_and_after');
+  afterAll(async () => {
+    if (app && typeof app.close === 'function') {
+      await app.close();
+    }
+  });
 
-  const insertDataQuery = `
-    INSERT INTO games (id, name, release_date, release_year, price, positive_reviews, negative_reviews, user_score, metacritic_score, average_playtime_forever, average_playtime_2weeks, median_playtime_forever) 
-    VALUES
-    (1, 'The Legend of Adventure', '2005-08-15', 2005, 49.99, 100000, 5000, 90, 85, 120, 30, 110),
-    (2, 'Mystery of the Lost World', '2006-03-22', 2006, 39.99, 85000, 4000, 80, 75, 200, 50, 180),
-    (3, 'Battle of the Realms', '2012-10-10', 2012, 59.99, 120000, 8000, 95, 90, 150, 40, 140),
-    (4, 'Racing Legends', '2009-06-05', 2009, 29.99, 95000, 3000, 85, 80, 180, 70, 160),
-    (5, 'Space Wars: Galaxy Defenders', '2015-07-20', 2015, 49.99, 110000, 6000, 88, 82, 220, 55, 210),
-    (6, 'Epic Quest: The Rise', '2020-11-01', 2020, 69.99, 150000, 10000, 92, 85, 250, 60, 240),
-    (7, 'Dungeon of Darkness', '2007-12-15', 2007, 39.99, 70000, 2000, 75, 70, 100, 20, 90),
-    (8, 'Super Jump Adventure', '2011-05-18', 2011, 19.99, 80000, 4000, 80, 78, 130, 45, 120),
-    (9, 'Ninja Fury: Path of Shadows', '2018-04-09', 2018, 59.99, 125000, 7000, 90, 88, 210, 50, 200),
-    (10, 'Zombie Survival: Apocalypse', '2023-01-29', 2023, 39.99, 105000, 5000, 85, 80, 180, 60, 170)
-  `;
-
-  await masterConnection.query(insertDataQuery);
-  await masterConnection.end();
-});
-
-
-afterAll(() => {
-  // Close the application server if it was started in the test
-  if (app && typeof app.close === 'function') {
-    app.close();
-  }
-  
-});
-
-  
-// ----------------------- Concurrency Tests -----------------------
-
-describe('Concurrency Tests', () => {
-    test('Case #1: Concurrent transactions in two or more nodes are reading the same data item.', async () => {
-        // Create connections to the master and slave1 databases
-        const connections = await Promise.all([
-          createConnection(dbConfigs.master), // Master connection
-          createConnection(dbConfigs.slave1)  // Slave1 connection
-        ]);
-      
-        // Create read queries for each connection
-        const queries = [
-          connections[0].query('SELECT * FROM games WHERE id = 1'), // Master reads from 'games'
-          connections[0].query('SELECT * FROM games WHERE id = 1'), // Concurrent read from master
-          connections[1].query('SELECT * FROM games_before_2010 WHERE id = 1'), // Slave1 reads from 'games_before_2010'
-          connections[1].query('SELECT * FROM games_before_2010 WHERE id = 1')  // Concurrent read from slave1
-        ];
-      
-        // Execute all queries concurrently
-        const results = await Promise.all(queries);
-      
-        // Validate results
-        results.forEach(([rows]) => {
-          expect(rows.length).toBeGreaterThan(0); // Verify data exists
-        });
-      
-        // Close all database connections
-        await Promise.all(connections.map(conn => conn.end()));
-    });
-      
-
-    test('Case #2: At least one transaction in the three nodes is writing (insert/update/delete) and the other concurrent transactions are reading the same data item.', async () => {
-        // Create connections to nodes
-        const masterConn = await createConnection(dbConfigs.master);
-        const slave2Conn = await createConnection(dbConfigs.slave2);
-      
-        // Perform concurrent operations:
-        // 1. Read from master and slave concurrently
-        // 2. Insert new data into the master node
-        const concurrentOperations = [
-          masterConn.query('SELECT * FROM games WHERE id = 11'), // Read from master concurrently
-          slave2Conn.query('SELECT * FROM games_2010_and_after WHERE id = 11'), // Read from slave2 concurrently
-          masterConn.query(
-            `INSERT INTO games (id, name, release_date, release_year, price, positive_reviews, negative_reviews, user_score, metacritic_score, average_playtime_forever, average_playtime_2weeks, median_playtime_forever) 
-            VALUES (11, 'New Game', '2024-12-02', 2024, 59.99, 5000, 200, 88, 85, 100, 20, 95)`
-          )
-        ];
-      
-        // Wait for all concurrent operations to complete
-        const results = await Promise.all(concurrentOperations);
-      
-        // Validate initial read results:
-        // - Since the insert operation is concurrent, the reads may not see the newly inserted data yet.
-        const [masterReadResult, slaveReadResult, _] = results;
-        
-        // Assert that the reads did not find the new record, since the insert was concurrent
-        expect(masterReadResult[0].length).toBe(0); // Master read should not have seen the inserted data at this point
-        expect(slaveReadResult[0].length).toBe(0); // Slave read should also not have seen the inserted data
-      
-        // Introduce a small delay to allow replication to complete
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      
-        // Re-query the data from both master and slave to confirm the insert is reflected
-        const followUpReads = [
-          masterConn.query('SELECT * FROM games WHERE id = 11'),
-          slave2Conn.query('SELECT * FROM games_2010_and_after WHERE id = 11')
-        ];
-      
-        const followUpResults = await Promise.all(followUpReads);
-      
-        // Validate read results after replication delay
-        followUpResults.forEach(([rows]) => {
-          expect(rows.length).toBeGreaterThan(0); // The new game should now be visible in both the master and the slave after replication
-        });
-      
-        // Close connections
-        await Promise.all([masterConn.end(), slave2Conn.end()]);
+  // =========================================================================
+  // 1. Data Fragmentation & CRUD Operations
+  // =========================================================================
+  describe('1. Data Fragmentation & CRUD Operations', () => {
+    test('Scenario 1: Add game before 2010 -> Replicates to Node 1 (games) and Node 2 (games_before_2010)', async () => {
+      const res = await request(app).post('/add-record').send({
+        name: 'Half-Life 2',
+        release_date: '2004-11-16',
+        release_year: 2004,
+        price: 9.99
       });
-      
-      
-      
-      
 
-  test('Case #3: Concurrent transactions in two or more nodes are writing (update / delete) the same data item.', async () => {
-    const masterConn1 = await createConnection(dbConfigs.master);
-    const masterConn2 = await createConnection(dbConfigs.master);
+      expect(res.status).toBe(200);
+      const newId = res.body.id;
 
-    // Simulating concurrent update transactions
-    const concurrentUpdates = [
-      masterConn1.query('UPDATE games SET price = price + 5 WHERE id = 1'),
-      masterConn2.query('UPDATE games SET price = price - 5 WHERE id = 1')
-    ];
+      const [n1] = await queryNode('node1', 'SELECT * FROM games WHERE id = ?', [newId]);
+      const [n2] = await queryNode('node2', 'SELECT * FROM games_before_2010 WHERE id = ?', [newId]);
+      const [n3] = await queryNode('node3', 'SELECT * FROM games_2010_and_after WHERE id = ?', [newId]);
 
-    // Execute concurrent updates
-    const updateResults = await Promise.allSettled(concurrentUpdates);
-
-    // Validate results - should either succeed or be rolled back correctly
-    updateResults.forEach(result => {
-      expect(result.status).toBe('fulfilled'); // Both transactions should be handled
+      expect(n1).toBeDefined();
+      expect(n2).toBeDefined();
+      expect(n3).toBeUndefined(); // Strictly disjoint
     });
 
-    // Close connections
-    await Promise.all([masterConn1.end(), masterConn2.end()]);
-  });
-});
+    test('Scenario 2: Add game from 2010 onward -> Replicates to Node 1 (games) and Node 3 (games_2010_and_after)', async () => {
+      const res = await request(app).post('/add-record').send({
+        name: 'Portal 2',
+        release_date: '2011-04-19',
+        release_year: 2011,
+        price: 19.99
+      });
 
-// ----------------------- Crash Recovery Tests -----------------------
+      expect(res.status).toBe(200);
+      const newId = res.body.id;
 
-describe('Crash Recovery Tests', () => {
-  test('Case #1: Central node unavailable during execution', async () => {
-    // Simulate disconnecting master
-    await request(app).post('/simulate-failure').send({ node: 'node1' });
+      const [n1] = await queryNode('node1', 'SELECT * FROM games WHERE id = ?', [newId]);
+      const [n2] = await queryNode('node2', 'SELECT * FROM games_before_2010 WHERE id = ?', [newId]);
+      const [n3] = await queryNode('node3', 'SELECT * FROM games_2010_and_after WHERE id = ?', [newId]);
 
-    // Attempt to write data while master is down
-    const writeAttempt = await request(app).post('/add-record').send({
-      id: 12,
-      name: 'Game A',
-      release_date: '2024-12-01',
-      release_year: 2024,
-      price: 49.99,
-      positive_reviews: 100,
-      negative_reviews: 10,
-      user_score: 90,
-      metacritic_score: 85,
-      average_playtime_forever: 30,
-      average_playtime_2weeks: 15,
-      median_playtime_forever: 10
+      expect(n1).toBeDefined();
+      expect(n2).toBeUndefined(); // Strictly disjoint
+      expect(n3).toBeDefined();
     });
 
-    expect(writeAttempt.status).toBe(503); // Write should be prohibited
+    test('Scenario 3: Cross-Fragment Migration -> Changing release_year across 2010 boundary moves record between fragments', async () => {
+      const addRes = await request(app).post('/add-record').send({
+        name: 'Prototype Remaster',
+        release_year: 2008,
+        price: 19.99
+      });
+      const gameId = addRes.body.id;
 
-    // Recover the central node
-    await request(app).post('/simulate-recovery').send({ node: 'node1' });
+      // Update release_year to 2015
+      const updateRes = await request(app).put('/update-record').send({
+        id: gameId,
+        name: 'Prototype Remaster Definitive',
+        release_year: 2015,
+        price: 29.99
+      });
 
-    // Compare relevant tables across all nodes
-    const masterNodeData = await request(app).get('/query').send({ query: 'SELECT * FROM games' });
-    const slaveNodeData = await request(app).get('/query').send({ query: 'SELECT * FROM games' });
+      expect(updateRes.status).toBe(200);
+      expect(updateRes.body.isMigration).toBe(true);
 
-    expect(masterNodeData.body).toEqual(slaveNodeData.body);
-  });
+      const [n1] = await queryNode('node1', 'SELECT * FROM games WHERE id = ?', [gameId]);
+      const [n2] = await queryNode('node2', 'SELECT * FROM games_before_2010 WHERE id = ?', [gameId]);
+      const [n3] = await queryNode('node3', 'SELECT * FROM games_2010_and_after WHERE id = ?', [gameId]);
 
-  test('Case #2: Disconnect and reconnect a slave node', async () => {
-  // Simulate disconnecting slave node
-  await request(app).post('/simulate-failure').send({ node: 'node2' });
-
-  // Attempt to read data from slave - should fail
-  let readAttempt;
-  try {
-    readAttempt = await request(app).post('/query').send({ query: 'SELECT * FROM games WHERE id = 1' });
-  } catch (err) {
-    expect(err).toBeDefined();
-  }
-
-  // Recover the slave node
-  await request(app).post('/simulate-recovery').send({ node: 'node2' });
-
-  // Verify that the slave node can now accept read operations
-  const slaveNodeData = await request(app).post('/query').send({ query: 'SELECT * FROM games WHERE id = 1' });
-  expect(slaveNodeData.status).toBe(200);
-});
-
-test('Case #3: Disconnect master during slave replication', async () => {
-  // Simulate disconnecting the master
-  await request(app).post('/simulate-failure').send({ node: 'node1' });
-
-  // Attempt to replicate to master - should fail
-  let writeAttempt;
-  try {
-    writeAttempt = await request(app).post('/add-record').send({
-      id: 13,
-      name: 'Replication Fail Test',
-      release_date: '2024-12-02',
-      release_year: 2024,
-      price: 39.99,
-      positive_reviews: 150,
-      negative_reviews: 10,
-      user_score: 75,
-      metacritic_score: 82,
-      average_playtime_forever: 18,
-      average_playtime_2weeks: 9,
-      median_playtime_forever: 10,
+      expect(n1.release_year).toBe(2015);
+      expect(n2).toBeUndefined(); // Deleted from old fragment
+      expect(n3).toBeDefined();   // Inserted into new fragment
+      expect(n3.name).toBe('Prototype Remaster Definitive');
     });
-  } catch (err) {
-    expect(err).toBeDefined();
-  }
 
-  // Recover the master
-  await request(app).post('/simulate-recovery').send({ node: 'node1' });
+    test('Scenario 4: Deletion removes record from master and relevant fragment with no stale copies', async () => {
+      const addRes = await request(app).post('/add-record').send({ name: 'Delete Target', release_year: 2005 });
+      const gameId = addRes.body.id;
 
-  // Verify data consistency across nodes
-  const masterData = await request(app).get('/query').send({ query: 'SELECT * FROM games WHERE id = 4' });
-  const slaveData = await request(app).get('/query').send({ query: 'SELECT * FROM games WHERE id = 4' });
+      const delRes = await request(app).delete(`/delete-record/${gameId}`);
+      expect(delRes.status).toBe(200);
 
-  expect(masterData.body).toEqual(slaveData.body);
-});
+      const [n1] = await queryNode('node1', 'SELECT * FROM games WHERE id = ?', [gameId]);
+      const [n2] = await queryNode('node2', 'SELECT * FROM games_before_2010 WHERE id = ?', [gameId]);
 
-test('Case #4: Disconnect a slave during replication', async () => {
-  // Simulate disconnecting the slave
-  await request(app).post('/simulate-failure').send({ node: 'node3' });
-
-  // Write to the master node
-  await request(app).post('/add-record').send({
-    id: 14,
-    name: 'Slave Failure Test',
-    release_date: '2024-12-04',
-    release_year: 2024,
-    price: 29.99,
-    positive_reviews: 150,
-    negative_reviews: 5,
-    user_score: 70,
-    metacritic_score: 80,
-    average_playtime_forever: 25,
-    average_playtime_2weeks: 10,
-    median_playtime_forever: 10,
+      expect(n1).toBeUndefined();
+      expect(n2).toBeUndefined();
+    });
   });
 
-  // Recover the slave node
-  await request(app).post('/simulate-recovery').send({ node: 'node3' });
-  await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait for 2 seconds
+  // =========================================================================
+  // 2. Transaction Log Durability, Atomicity & Rollback
+  // =========================================================================
+  describe('2. Transaction Log Durability and Atomicity', () => {
+    test('Master write and replication-log entry commit atomically in same local transaction', async () => {
+      await request(app).post('/simulate-failure').send({ node: 'node2' });
 
-  // Verify that the slave node has replicated the new data
-  const slaveNodeData = await request(app)
-    .post('/query')
-    .send({ query: 'SELECT * FROM games_2010_and_after WHERE id = 5' });
+      const res = await request(app).post('/add-record').send({
+        name: 'Atomic Game',
+        release_year: 2006,
+        price: 15.00
+      });
 
-  expect(slaveNodeData.status).toBe(200);
-  expect(slaveNodeData.body.transactions.length).toBeGreaterThan(0);
-});
+      expect(res.status).toBe(200);
+      const gameId = res.body.id;
 
+      const [n1Game] = await queryNode('node1', 'SELECT * FROM games WHERE id = ?', [gameId]);
+      expect(n1Game).toBeDefined();
+
+      const pending = await getPendingReplicationsForNode('node2');
+      expect(pending.length).toBe(1);
+      expect(pending[0].recordId).toBe(gameId);
+      expect(pending[0].status).toBe('PENDING');
+    });
+
+    test('Rollback safety: Aborted master transaction leaves no orphan replication logs', async () => {
+      let threw = false;
+      try {
+        await withTransaction('node1', async (tx) => {
+          await tx.query(`INSERT INTO games (id, name, release_date, release_year, price) VALUES (999, 'Rollback Game', '2005-01-01', 2005, 10.00)`);
+          await tx.query(`INSERT INTO replication_log (tx_id, target_node, operation, record_id, payload, status) VALUES ('tx_rollback_999', 'node2', 'INSERT', 999, '{}', 'PENDING')`);
+          throw new Error('Simulated Rollback');
+        });
+      } catch (e) {
+        threw = true;
+      }
+      expect(threw).toBe(true);
+
+      const [g] = await queryNode('node1', 'SELECT * FROM games WHERE id = ?', [999]);
+      expect(g).toBeUndefined();
+
+      const logs = await getPendingReplicationsForNode('node2');
+      expect(logs.find(l => l.txId === 'tx_rollback_999')).toBeUndefined();
+    });
+  });
+
+  // =========================================================================
+  // 3. Multi-Instance Recovery Coordination & Abandoned Locks
+  // =========================================================================
+  describe('3. Multi-Instance Recovery Coordination', () => {
+    test('Conditional claiming prevents concurrent workers from replaying the same transaction', async () => {
+      await request(app).post('/simulate-failure').send({ node: 'node2' });
+      await request(app).post('/add-record').send({ name: 'Worker Contention Game', release_year: 2002 });
+
+      const pending = await getPendingReplicationsForNode('node2');
+      const entry = pending[0];
+
+      const claimedA = await claimReplicationEntry(entry.logId, entry.txId, 'worker_A');
+      const claimedB = await claimReplicationEntry(entry.logId, entry.txId, 'worker_B');
+
+      expect(claimedA).toBe(true);
+      expect(claimedB).toBe(false); // Second claim rejected!
+    });
+
+    test('Abandoned IN_PROGRESS entries are reclaimed after worker crash timeout', async () => {
+      await request(app).post('/simulate-failure').send({ node: 'node2' });
+      await request(app).post('/add-record').send({ name: 'Crash Reclaim Game', release_year: 2003 });
+
+      const pending = await getPendingReplicationsForNode('node2');
+      const entry = pending[0];
+
+      await claimReplicationEntry(entry.logId, entry.txId, 'crashed_worker');
+
+      // Age timestamp past 30s threshold
+      const oldTime = new Date(Date.now() - 40000).toISOString();
+      const dbEntry = getMockDatabases().node1.replication_log.get(entry.txId);
+      if (dbEntry) {
+        dbEntry.claimed_at = oldTime;
+        dbEntry.claimedAt = oldTime;
+      }
+      const qEntry = getAllPendingReplications().find(e => e.txId === entry.txId);
+      if (qEntry) {
+        qEntry.claimedAt = oldTime;
+        qEntry.claimed_at = oldTime;
+      }
+
+      const reclaimed = await claimReplicationEntry(entry.logId, entry.txId, 'recovering_worker');
+      expect(reclaimed).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // 4. Sequence Counter Initialization & Concurrency
+  // =========================================================================
+  describe('4. Sequence Counter Initialization & Concurrency', () => {
+    test('Sequence counter initializes above pre-existing records to prevent duplicate IDs', async () => {
+      // Pre-seed games table with record ID 500
+      await queryNode('node1', `INSERT INTO games (id, name, release_date, release_year, price) VALUES (500, 'Pre-existing Game', '2005-01-01', 2005, 10.00)`);
+
+      const res = await request(app).post('/add-record').send({ name: 'Sequential New Game', release_year: 2007 });
+      expect(res.status).toBe(200);
+      expect(res.body.id).toBe(501); // Guaranteed to start above 500
+    });
+
+    test('Concurrent simultaneous inserts assign strictly unique monotonic IDs', async () => {
+      const inserts = Array.from({ length: 8 }, (_, i) =>
+        request(app).post('/add-record').send({ name: `Concurrent Game ${i + 1}`, release_year: 2018 })
+      );
+
+      const results = await Promise.all(inserts);
+      const ids = results.map(r => r.body.id);
+      const uniqueIds = new Set(ids);
+
+      expect(uniqueIds.size).toBe(8);
+      expect(ids.every(id => Number.isInteger(id) && id > 0)).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // 5. Query Completeness, Truth Table & Distributed Reconstruction
+  // =========================================================================
+  describe('5. Query Completeness, Freshness & Truth Table', () => {
+    beforeEach(async () => {
+      await request(app).post('/add-record').send({ name: 'Retro Game', release_year: 2001, price: 10.00 });
+      await request(app).post('/add-record').send({ name: 'Modern Game', release_year: 2021, price: 60.00 });
+    });
+
+    test('State 1: [Up, Up, Up] -> Complete dataset served by Central Master', async () => {
+      const res = await request(app).post('/query').send({ query: 'SELECT * FROM {TABLE}' });
+      expect(res.status).toBe(200);
+      expect(res.body.isComplete).toBe(true);
+      expect(res.body.isPartial).toBe(false);
+      expect(res.body.node).toBe('node1');
+    });
+
+    test('State 2: [Down, Up, Up] -> Complete reconstructed dataset when no pending logs exist', async () => {
+      await request(app).post('/simulate-failure').send({ node: 'node1' });
+
+      const res = await request(app).post('/query').send({ query: 'SELECT * FROM {TABLE}' });
+      expect(res.status).toBe(200);
+      expect(res.body.reconstructed).toBe(true);
+      expect(res.body.isComplete).toBe(true);
+      expect(res.body.isStale).toBe(false);
+      expect(res.body.transactions.length).toBe(2);
+    });
+
+    test('Replication Staleness Flag: Reconstruction flags potential staleness when fragment has unapplied writes', async () => {
+      // Simulate write while Node 2 was down before Node 1 failure
+      await request(app).post('/simulate-failure').send({ node: 'node2' });
+      await request(app).post('/add-record').send({ name: 'Pending Lag Game', release_year: 2004 });
+
+      // Node 1 fails, Node 2 recovers (unapplied log remains)
+      await request(app).post('/simulate-failure').send({ node: 'node1' });
+      setSimulatedFailure('node2', false);
+
+      const res = await request(app).post('/query').send({ query: 'SELECT * FROM {TABLE}' });
+      expect(res.status).toBe(200);
+      expect(res.body.reconstructed).toBe(true);
+      expect(res.body.isStale).toBe(true);
+      expect(res.body.isComplete).toBe(false);
+      expect(res.body.warning).toContain('Reconstructed dataset is potentially stale');
+    });
+
+    test('State 3 & 4: Partial states explicitly warn client when only one fragment is reachable', async () => {
+      await request(app).post('/simulate-failure').send({ node: 'node1' });
+      await request(app).post('/simulate-failure').send({ node: 'node3' });
+
+      const res = await request(app).post('/query').send({ query: 'SELECT * FROM {TABLE}' });
+      expect(res.status).toBe(200);
+      expect(res.body.isComplete).toBe(false);
+      expect(res.body.isPartial).toBe(true);
+      expect(res.body.warning).toContain('Partial dataset: Node 1 and Node 3 are unavailable');
+      expect(res.body.transactions.length).toBe(1);
+    });
+
+    test('Reconstruction merges distributed COUNT(*) aggregations correctly', async () => {
+      await request(app).post('/simulate-failure').send({ node: 'node1' });
+
+      const res = await request(app).post('/query').send({ query: 'SELECT COUNT(*) AS count FROM {TABLE}' });
+      expect(res.status).toBe(200);
+      expect(res.body.transactions[0].count).toBe(2);
+    });
+
+    test('Reconstruction applies global ORDER BY and LIMIT across merged fragments', async () => {
+      await request(app).post('/simulate-failure').send({ node: 'node1' });
+
+      const res = await request(app).post('/query').send({ query: 'SELECT * FROM {TABLE} ORDER BY price DESC LIMIT 1' });
+      expect(res.status).toBe(200);
+      expect(res.body.transactions.length).toBe(1);
+      expect(res.body.transactions[0].name).toBe('Modern Game'); // Highest price ($60.00)
+    });
+
+    test('Unsupported queries (GROUP BY/JOIN) return explicit 400 error during reconstruction', async () => {
+      await request(app).post('/simulate-failure').send({ node: 'node1' });
+
+      const res = await request(app).post('/query').send({ query: 'SELECT release_year, COUNT(*) FROM {TABLE} GROUP BY release_year' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('Complex queries with GROUP BY, JOIN, or HAVING cannot be safely reconstructed');
+    });
+  });
+
+  // =========================================================================
+  // 6. Recovery Synchronization & Replay Idempotency
+  // =========================================================================
+  describe('6. Recovery Synchronization & Replay Idempotency', () => {
+    test('Recovery replays strictly in FIFO sequence and duplicate replays are idempotent', async () => {
+      await request(app).post('/simulate-failure').send({ node: 'node2' });
+
+      const g1 = await request(app).post('/add-record').send({ name: 'Sequence Game 1', release_year: 2002 });
+      const g2 = await request(app).post('/add-record').send({ name: 'Sequence Game 2', release_year: 2003 });
+
+      const pending = await getPendingReplicationsForNode('node2');
+      expect(pending[0].recordId).toBe(g1.body.id);
+      expect(pending[1].recordId).toBe(g2.body.id);
+      expect(pending[0].logId).toBeLessThan(pending[1].logId);
+
+      // Replay recovery
+      const rec = await request(app).post('/simulate-recovery').send({ node: 'node2' });
+      expect(rec.status).toBe(200);
+      expect(rec.body.replayedCount).toBe(2);
+
+      // Duplicate recovery trigger
+      const dupRec = await request(app).post('/simulate-recovery').send({ node: 'node2' });
+      expect(dupRec.status).toBe(200);
+
+      const rowsA = await queryNode('node2', 'SELECT * FROM games_before_2010 WHERE id = ?', [g1.body.id]);
+      expect(rowsA.length).toBe(1);
+    });
+
+    test('Pending transactions survive backend restart from durable disk backup', async () => {
+      await request(app).post('/simulate-failure').send({ node: 'node3' });
+      const res = await request(app).post('/add-record').send({ name: 'Restart Game', release_year: 2024 });
+
+      // Simulate backend restart by reloading disk backup
+      loadQueueFromDisk();
+
+      const pendingAfterRestart = await getPendingReplicationsForNode('node3');
+      expect(pendingAfterRestart.some(e => e.recordId === res.body.id)).toBe(true);
+
+      const rec = await request(app).post('/simulate-recovery').send({ node: 'node3' });
+      expect(rec.status).toBe(200);
+
+      const [n3Game] = await queryNode('node3', 'SELECT * FROM games_2010_and_after WHERE id = ?', [res.body.id]);
+      expect(n3Game).toBeDefined();
+    });
+  });
 });

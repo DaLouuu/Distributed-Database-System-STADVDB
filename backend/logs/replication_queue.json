@@ -1,0 +1,28 @@
+[
+  {
+    "logId": 1,
+    "txId": "tx_1793639427379_c4twfnhkc",
+    "targetNode": "node3",
+    "operation": "INSERT",
+    "recordId": 1,
+    "payload": {
+      "id": 1,
+      "name": "Restart Game",
+      "release_date": "2026-11-02",
+      "release_year": 2024,
+      "price": 0,
+      "positive_reviews": 0,
+      "negative_reviews": 0,
+      "user_score": 0,
+      "metacritic_score": 0,
+      "average_playtime_forever": 0,
+      "average_playtime_2weeks": 0,
+      "median_playtime_forever": 0
+    },
+    "status": "APPLIED",
+    "workerId": null,
+    "claimedAt": null,
+    "createdAt": "2026-11-02T17:10:27.379Z",
+    "updatedAt": "2026-11-02T17:10:27.394Z"
+  }
+]
